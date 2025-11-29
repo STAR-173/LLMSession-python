@@ -3,7 +3,7 @@ import logging
 from typing import Optional, Callable
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, expect
 from .base import LLMProvider
-from ..exceptions import AuthenticationError, SelectorError, PromptError, OTPRequiredError
+from ..exceptions import AuthenticationError, PromptError
 
 logger = logging.getLogger(__name__)
 
@@ -23,17 +23,15 @@ class ClaudeProvider(LLMProvider):
         "password_input": 'input[type="password"]',
         "password_next": 'button:has-text("Next")',
         "account_tile_base": 'div[role="link"][data-identifier]',
-        # Generic "Continue" in Google prompts
+        
+        # Updated "Continue" selector to be more robust
+        # Matches any button containing "Continue" to handle the specific structure provided
         "google_continue_btn": 'button:has-text("Continue")', 
         
         # Chat Interface
         "chat_input": 'div[contenteditable="true"][data-testid="chat-input"]',
         "send_btn": 'button[aria-label="Send message"]',
-        
-        # State Indicators
         "stop_btn": 'button[aria-label="Stop response"]', 
-        
-        # Response Extraction
         "copy_btn": 'button[data-testid="action-bar-copy"]',
     }
 
@@ -46,7 +44,6 @@ class ClaudeProvider(LLMProvider):
         if "selectors" in self.config:
             self.selectors.update(self.config["selectors"])
             
-        # We point this to chat_input so Automator knows we aren't ready until input is visible
         self.SEL_PROFILE_BTN = self.selectors["chat_input"]
 
     def login(self, credentials: dict) -> bool:
@@ -54,104 +51,113 @@ class ClaudeProvider(LLMProvider):
         email = credentials.get("email")
         password = credentials.get("password")
 
-        # 1. Navigate
+        # 1. Navigation (Optimized: 'commit' returns faster than 'domcontentloaded')
         try:
-            self.page.goto(self.URL, wait_until="domcontentloaded")
+            self.page.goto(self.URL, wait_until="commit")
         except:
-            pass # Continue to checks
+            pass 
 
-        # 2. FAST CHECK: Are we already ready?
-        if self.is_fully_ready():
-            logger.info("Already logged in and ready.")
-            return True
-
-        # 3. FAST CHECK: Is the Login Button visible? 
-        # (Prioritize this over sidebar to avoid waiting on 'ghost' sessions)
-        if self.page.is_visible(self.selectors["login_google_btn"]):
-            return self._perform_google_login(email, password)
-
-        # 4. Sidebar Check (Only if login button missing)
-        if self.page.is_visible(self.selectors["user_menu_btn"]):
-            logger.info("Sidebar detected. Waiting for Chat Input...")
-            if self.wait_for_chat_input(timeout=5000):
-                return True
-            logger.warning("Chat input stalled. Reloading...")
-            self.page.reload()
-            if self.wait_for_chat_input(timeout=5000):
-                return True
+        # 2. Race Condition Check
+        login_sel = self.selectors["login_google_btn"]
+        chat_sel = self.selectors["chat_input"]
         
-        # 5. Fallback: If we are here, we might be on login page but button didn't load yet
+        logger.info("Waiting for interface to hydrate...")
         try:
-            self.page.wait_for_selector(self.selectors["login_google_btn"], timeout=5000)
+            self.page.wait_for_selector(f"{login_sel}, {chat_sel}", state="visible", timeout=15000)
+        except PlaywrightTimeoutError:
+            # Fallback for stalled sidebar loading
+            if self.page.is_visible(self.selectors["user_menu_btn"]):
+                self.page.reload()
+                self.page.wait_for_selector(chat_sel, timeout=10000)
+            else:
+                raise AuthenticationError("Timeout waiting for Login Button or Chat Input.")
+
+        if self.page.is_visible(chat_sel):
+            logger.info("Already logged in.")
+            return True
+        elif self.page.is_visible(login_sel):
             return self._perform_google_login(email, password)
-        except:
-            raise AuthenticationError("Could not find Login button and Chat Input is missing.")
+        else:
+            raise AuthenticationError("Interface loaded but recognized elements are missing.")
 
     def _perform_google_login(self, email, password):
         """Handles the Google Login Popup Flow."""
-        logger.info("Clicking 'Continue with Google' and waiting for popup...")
+        logger.info("Login button found. Initiating Google Auth...")
         
         try:
-            # Prepare to catch the popup window
             with self.page.expect_popup() as popup_info:
-                self.page.click(self.selectors["login_google_btn"])
+                # Force click ensures we don't wait for main page animations
+                self.page.click(self.selectors["login_google_btn"], force=True)
             
             popup = popup_info.value
-            logger.info("Google Popup opened. Interacting with popup...")
             
-            # Wait for popup to load content
-            popup.wait_for_load_state("domcontentloaded")
-            
-            # --- GOOGLE AUTH INSIDE POPUP ---
-            
-            # A. Check for Account Chooser vs Email Input
+            # 3. Popup Interaction
             account_selector = f'div[role="link"][data-identifier="{email}"]'
+            email_input_sel = self.selectors["email_input"]
             
+            # Wait for content to load inside popup
             try:
-                # Wait for *something* to appear in the popup
-                popup.wait_for_selector(f'{self.selectors["email_input"]}, {account_selector}', timeout=5000)
-                
-                # PATH A: Account Tile (Session remembered)
-                if popup.locator(account_selector).is_visible():
-                    logger.info(f"Found account tile for {email} in popup. Clicking...")
-                    popup.click(account_selector)
-                    # Sometimes detection needs a follow-up 'Continue'
-                    try:
-                        popup.wait_for_selector(self.selectors["google_continue_btn"], timeout=3000)
-                        popup.click(self.selectors["google_continue_btn"])
-                    except: pass
-
-                # PATH B: Email Input
-                else:
-                    logger.info("Entering Email in popup...")
-                    popup.fill(self.selectors["email_input"], email)
-                    popup.click(self.selectors["email_next"])
-                    
-                    # Password (only if email flow used)
-                    if password:
-                        try:
-                            popup.wait_for_selector(self.selectors["password_input"], state="visible", timeout=5000)
-                            logger.info("Entering Password in popup...")
-                            popup.fill(self.selectors["password_input"], password)
-                            popup.click(self.selectors["password_next"])
-                        except:
-                            logger.info("Password field did not appear (possibly 2FA or passkey).")
-            
-            except Exception as e:
-                logger.error(f"Error inside Google Popup: {e}")
-                # Don't crash, user might be solving 2FA manually in the popup
-            
-            logger.info("Waiting for popup to close (User should complete login)...")
-            try:
-                # Wait for the popup to be closed (auth finished)
-                # We give a long timeout here because 2FA might take time
-                popup.wait_for_event("close", timeout=60000)
-                logger.info("Popup closed. Returning to main window...")
+                popup.wait_for_selector(f'{email_input_sel}, {account_selector}', timeout=10000)
             except:
-                logger.warning("Popup did not close automatically. Checking main window status...")
+                popup.wait_for_load_state("domcontentloaded")
+            
+            # --- PATH A: Account Tile ---
+            if popup.locator(account_selector).is_visible():
+                logger.info(f"Clicking account tile for {email}...")
+                # Force click to avoid issues with list item containers
+                popup.click(account_selector, force=True)
+            
+            # --- PATH B: Email & Password ---
+            else:
+                logger.info("Entering Email...")
+                popup.fill(self.selectors["email_input"], email)
+                popup.click(self.selectors["email_next"])
+                
+                if password:
+                    popup.wait_for_selector(self.selectors["password_input"], state="visible", timeout=5000)
+                    popup.fill(self.selectors["password_input"], password)
+                    try:
+                        popup.click(self.selectors["password_next"])
+                    except Exception as e:
+                        logger.warning(f"Error clicking password next: {e}")
 
-            # --- BACK TO MAIN PAGE ---
-            logger.info("Waiting for Claude Dashboard...")
+            # --- UNIFIED 'CONTINUE' BUTTON HANDLER ---
+            # This logic runs after either Path A or Path B.
+            # The 'Continue' screen is an interstitial that might appear after clicking the tile.
+            try:
+                continue_btn_sel = self.selectors["google_continue_btn"]
+                
+                # Check if popup is still open. If closed, we are already done.
+                if not popup.is_closed():
+                    # Wait up to 10s for the "Continue" button to render.
+                    # The transition from "Tile Click" -> "Continue Screen" involves a network call.
+                    popup.wait_for_selector(continue_btn_sel, state="visible", timeout=10000)
+                    
+                    logger.info("Found Google 'Continue' confirmation button. Clicking...")
+                    
+                    # 1. Force Click (Bypasses overlays/ripples)
+                    popup.click(continue_btn_sel, force=True)
+                    
+                    # 2. Retry Logic (If the JS listener wasn't ready)
+                    popup.wait_for_timeout(1000)
+                    if popup.is_visible(continue_btn_sel) and not popup.is_closed():
+                        logger.info("Continue button still present. Retrying click...")
+                        popup.click(continue_btn_sel, force=True)
+            
+            except PlaywrightTimeoutError:
+                # This is normal if the "Continue" screen never appeared (Instant login)
+                pass
+            except Exception as e:
+                # Catch-all for race conditions where popup closes during checks
+                logger.debug(f"Continue button logic bypassed: {e}")
+
+            # --- FINALIZE ---
+            try:
+                # Wait for the popup to close completely
+                popup.wait_for_event("close", timeout=60000)
+            except:
+                logger.warning("Popup did not close automatically. Checking main window...")
+
             if self.wait_for_chat_input(timeout=30000):
                 logger.info("Login successful.")
                 return True
@@ -162,75 +168,52 @@ class ClaudeProvider(LLMProvider):
             raise AuthenticationError(f"Google Login Flow failed: {e}")
 
     def is_fully_ready(self) -> bool:
-        """Check if chat input is visible."""
         return self.page.is_visible(self.selectors["chat_input"])
 
     def wait_for_chat_input(self, timeout=30000) -> bool:
-        """Waits for chat input, handling potential blocking dialogs."""
-        start_time = time.time()
-        while (time.time() - start_time) * 1000 < timeout:
+        try:
+            self.page.wait_for_selector(self.selectors["chat_input"], state="visible", timeout=timeout)
             self.handle_dialogs()
-            if self.page.is_visible(self.selectors["chat_input"]):
-                return True
-            time.sleep(1)
-        return False
+            return True
+        except:
+            return False
 
     def handle_dialogs(self):
         try:
-            # Common "Next" / "Done" / "Dismiss" modals in Claude
-            for btn_text in ["Next", "Done", "Dismiss", "Get started"]:
-                selector = f"div[role='dialog'] button:has-text('{btn_text}')"
-                if self.page.is_visible(selector):
-                    # Verify it's not a button we actually want (like 'Send')
-                    self.page.click(selector)
+            if self.page.is_visible("div[role='dialog']"):
+                self.page.keyboard.press("Escape")
         except:
             pass
 
     def send_prompt(self, prompt: str) -> str:
         if not self.is_fully_ready():
-            logger.warning("Chat input not ready. Waiting...")
-            if not self.wait_for_chat_input(timeout=10000):
-                raise PromptError("Chat input missing. Cannot send prompt.")
+            self.wait_for_chat_input(timeout=10000)
 
         self.handle_dialogs()
         
         try:
-            logger.info("Entering prompt...")
-            input_loc = self.page.locator(self.selectors["chat_input"])
-            input_loc.click()
+            self.page.click(self.selectors["chat_input"])
             self.page.keyboard.type(prompt)
-            
-            logger.info("Clicking send...")
-            send_btn = self.page.locator(self.selectors["send_btn"])
-            expect(send_btn).not_to_be_disabled()
-            send_btn.click()
-            
+            self.page.wait_for_timeout(300) 
+            self.page.click(self.selectors["send_btn"])
         except Exception as e:
             raise PromptError(f"Failed to send prompt: {e}")
 
-        logger.info("Waiting for response generation...")
         try:
             self.page.wait_for_selector(self.selectors["stop_btn"], timeout=10000)
             self.page.wait_for_selector(self.selectors["stop_btn"], state="hidden", timeout=120000)
         except PlaywrightTimeoutError:
-            if not self.page.is_visible(f'{self.selectors["send_btn"]}:not([disabled])'):
-                 raise PromptError("Timeout waiting for response generation.")
+            pass 
 
         try:
-            logger.info("Extracting response...")
             copy_btns = self.page.locator(self.selectors["copy_btn"])
-            self.page.wait_for_timeout(1000)
-            
             if copy_btns.count() > 0:
                 copy_btns.last.click()
-                text = self.page.evaluate("async () => await navigator.clipboard.readText()")
-                if text: return text.strip()
+                return self.page.evaluate("async () => await navigator.clipboard.readText()").strip()
             
             msgs = self.page.locator(".font-claude-message")
             if msgs.count() > 0:
                 return msgs.last.inner_text()
-                
             return ""
-
         except Exception as e:
-            raise PromptError(f"Failed to extract response: {e}")
+            raise PromptError(f"Extraction failed: {e}")

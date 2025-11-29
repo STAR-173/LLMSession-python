@@ -2,6 +2,9 @@ import os
 import sys
 import time
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Add src to path so we can import without installing
 sys.path.append(str(Path(__file__).parent / "python" / "src"))

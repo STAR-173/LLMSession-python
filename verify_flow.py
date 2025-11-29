@@ -1,6 +1,9 @@
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Add src to path so we can import without installing
 sys.path.append(str(Path(__file__).parent / "src"))
