@@ -4,6 +4,7 @@ from .browser import BrowserManager
 from .config import Config
 from .providers.chatgpt import ChatGPTProvider
 from .providers.aistudio import GoogleAIStudioProvider
+from .providers.claude import ClaudeProvider
 from .exceptions import SetupError, OTPRequiredError
 
 logger = logging.getLogger(__name__)
@@ -29,11 +30,9 @@ class Automator:
     def _setup(self):
         """Initialize browser and provider."""
         # 1. Start Browser
-        # Pass session_path if available to load cookies
         page = self.browser_manager.start(headless=self.headless, session_path=self.session_path)
         
-        # Grant clipboard permissions for response extraction
-        # This is critical for AI Studio
+        # Grant clipboard permissions
         self.browser_manager.context.grant_permissions(["clipboard-read", "clipboard-write"])
         
         # 2. Initialize Provider
@@ -41,6 +40,8 @@ class Automator:
             self.provider = ChatGPTProvider(page, config=self.config, on_otp_required=self.on_otp_required)
         elif self.provider_name == "aistudio":
             self.provider = GoogleAIStudioProvider(page, config=self.config, on_otp_required=self.on_otp_required)
+        elif self.provider_name == "claude":
+            self.provider = ClaudeProvider(page, config=self.config, on_otp_required=self.on_otp_required)
         else:
             raise NotImplementedError(f"Provider {self.provider_name} not supported.")
             
@@ -48,34 +49,24 @@ class Automator:
         if not self.browser_manager.is_authenticated(self.provider.URL, self.provider.SEL_PROFILE_BTN):
             logger.info("Not authenticated. Initiating login...")
             
-            # Prioritize passed credentials, fallback to Config/Env vars
             creds = self.credentials or Config.get_credentials(self.provider_name)
             
-            if not creds.get("email") or not creds.get("password"):
-                raise SetupError(f"Credentials not found for {self.provider_name}. Pass them to Automator() or set environment variables.")
+            if not creds.get("email"):
+                raise SetupError(f"Credentials (email) not found for {self.provider_name}.")
             
             self.provider.login(creds)
             
-            # Save session if path provided
             if self.session_path:
                 self.browser_manager.save_session(self.session_path)
-                logger.info(f"Session saved to {self.session_path}")
         else:
             logger.info("Session authenticated.")
 
     def process_prompt(self, prompt: str) -> str:
-        """
-        Send a single prompt and get the response.
-        """
         if not self.provider:
             raise SetupError("Provider not initialized.")
         return self.provider.send_prompt(prompt)
 
     def process_chain(self, prompts: List[Union[str, Callable[[str], str]]]) -> List[str]:
-        """
-        Process a chain of prompts. 
-        Supports string formatting with {} (previous response injected) or callables.
-        """
         responses = []
         last_response = ""
         
@@ -92,7 +83,7 @@ class Automator:
                         current_prompt = prompt_item.format(last_response)
                     except ValueError:
                         current_prompt = prompt_item
-                elif "{{}}" in prompt_item: # Support legacy double braces
+                elif "{{}}" in prompt_item:
                     current_prompt = prompt_item.replace("{{}}", last_response)
                 else:
                     current_prompt = prompt_item
@@ -105,5 +96,4 @@ class Automator:
         return responses
 
     def close(self):
-        """Clean up resources."""
         self.browser_manager.stop()
