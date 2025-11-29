@@ -33,10 +33,6 @@ env/
 ENV/
 .venv/
 
-# --- Verification ---
-verify_aistudio.py
-verify_flow.py
-
 # --- Playwright ---
 test-results/
 playwright-report/
