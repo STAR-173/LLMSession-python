@@ -14,21 +14,20 @@ class Config:
         
         if provider == "chatgpt":
             return {
-                "email": os.environ.get("CHATGPT_EMAIL") or email,
-                "password": os.environ.get("CHATGPT_PASSWORD") or password,
-                "google_login": os.environ.get("CHATGPT_GOOGLE_LOGIN", "false").lower() == "true",
-                "method": os.environ.get("LLM_METHOD", "email")
+                "email": email,
+                "password": password,
+                "method": "google"
             }
         elif provider == "aistudio":
             return {
-                "email": os.environ.get("AISTUDIO_EMAIL") or email,
-                "password": os.environ.get("AISTUDIO_PASSWORD") or password,
+                "email": email,
+                "password": password,
                 "method": "google"
             }
         elif provider == "claude":
             return {
-                "email": os.environ.get("CLAUDE_EMAIL") or email,
-                "password": os.environ.get("CLAUDE_PASSWORD") or password,
+                "email": email,
+                "password": password,
                 "method": "google"
             }
         return {}

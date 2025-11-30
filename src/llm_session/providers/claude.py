@@ -25,7 +25,6 @@ class ClaudeProvider(LLMProvider):
         "account_tile_base": 'div[role="link"][data-identifier]',
         
         # Updated "Continue" selector to be more robust
-        # Matches any button containing "Continue" to handle the specific structure provided
         "google_continue_btn": 'button:has-text("Continue")', 
         
         # Chat Interface
@@ -33,6 +32,10 @@ class ClaudeProvider(LLMProvider):
         "send_btn": 'button[aria-label="Send message"]',
         "stop_btn": 'button[aria-label="Stop response"]', 
         "copy_btn": 'button[data-testid="action-bar-copy"]',
+        
+        # --- Cookie Banner ---
+        "cookie_banner": '[data-testid="consent-banner"]',
+        "cookie_reject_btn": 'button[data-testid="consent-reject"]'
     }
 
     def __init__(self, page: Page, config: Optional[dict] = None, on_otp_required: Optional[Callable[[], str]] = None):
@@ -51,11 +54,14 @@ class ClaudeProvider(LLMProvider):
         email = credentials.get("email")
         password = credentials.get("password")
 
-        # 1. Navigation (Optimized: 'commit' returns faster than 'domcontentloaded')
+        # 1. Navigation
         try:
             self.page.goto(self.URL, wait_until="commit")
         except:
             pass 
+        
+        # Check cookies immediately on load
+        self.handle_dialogs()
 
         # 2. Race Condition Check
         login_sel = self.selectors["login_google_btn"]
@@ -65,7 +71,6 @@ class ClaudeProvider(LLMProvider):
         try:
             self.page.wait_for_selector(f"{login_sel}, {chat_sel}", state="visible", timeout=15000)
         except PlaywrightTimeoutError:
-            # Fallback for stalled sidebar loading
             if self.page.is_visible(self.selectors["user_menu_btn"]):
                 self.page.reload()
                 self.page.wait_for_selector(chat_sel, timeout=10000)
@@ -86,7 +91,6 @@ class ClaudeProvider(LLMProvider):
         
         try:
             with self.page.expect_popup() as popup_info:
-                # Force click ensures we don't wait for main page animations
                 self.page.click(self.selectors["login_google_btn"], force=True)
             
             popup = popup_info.value
@@ -95,19 +99,17 @@ class ClaudeProvider(LLMProvider):
             account_selector = f'div[role="link"][data-identifier="{email}"]'
             email_input_sel = self.selectors["email_input"]
             
-            # Wait for content to load inside popup
             try:
                 popup.wait_for_selector(f'{email_input_sel}, {account_selector}', timeout=10000)
             except:
                 popup.wait_for_load_state("domcontentloaded")
             
-            # --- PATH A: Account Tile ---
+            # Path A: Account Tile
             if popup.locator(account_selector).is_visible():
                 logger.info(f"Clicking account tile for {email}...")
-                # Force click to avoid issues with list item containers
                 popup.click(account_selector, force=True)
             
-            # --- PATH B: Email & Password ---
+            # Path B: Email & Password
             else:
                 logger.info("Entering Email...")
                 popup.fill(self.selectors["email_input"], email)
@@ -121,39 +123,23 @@ class ClaudeProvider(LLMProvider):
                     except Exception as e:
                         logger.warning(f"Error clicking password next: {e}")
 
-            # --- UNIFIED 'CONTINUE' BUTTON HANDLER ---
-            # This logic runs after either Path A or Path B.
-            # The 'Continue' screen is an interstitial that might appear after clicking the tile.
+            # Unified 'Continue' Button
             try:
                 continue_btn_sel = self.selectors["google_continue_btn"]
-                
-                # Check if popup is still open. If closed, we are already done.
                 if not popup.is_closed():
-                    # Wait up to 10s for the "Continue" button to render.
-                    # The transition from "Tile Click" -> "Continue Screen" involves a network call.
                     popup.wait_for_selector(continue_btn_sel, state="visible", timeout=10000)
-                    
-                    logger.info("Found Google 'Continue' confirmation button. Clicking...")
-                    
-                    # 1. Force Click (Bypasses overlays/ripples)
+                    logger.info("Found Google 'Continue' button. Clicking...")
                     popup.click(continue_btn_sel, force=True)
-                    
-                    # 2. Retry Logic (If the JS listener wasn't ready)
                     popup.wait_for_timeout(1000)
                     if popup.is_visible(continue_btn_sel) and not popup.is_closed():
-                        logger.info("Continue button still present. Retrying click...")
                         popup.click(continue_btn_sel, force=True)
-            
             except PlaywrightTimeoutError:
-                # This is normal if the "Continue" screen never appeared (Instant login)
                 pass
             except Exception as e:
-                # Catch-all for race conditions where popup closes during checks
                 logger.debug(f"Continue button logic bypassed: {e}")
 
-            # --- FINALIZE ---
+            # Finalize
             try:
-                # Wait for the popup to close completely
                 popup.wait_for_event("close", timeout=60000)
             except:
                 logger.warning("Popup did not close automatically. Checking main window...")
@@ -179,6 +165,19 @@ class ClaudeProvider(LLMProvider):
             return False
 
     def handle_dialogs(self):
+        """Handle Cookie Banners and standard dialogs."""
+        # 1. Cookie Banner
+        try:
+            if self.page.is_visible(self.selectors["cookie_banner"]):
+                logger.info("Cookie banner detected. Rejecting...")
+                self.page.click(self.selectors["cookie_reject_btn"])
+                # Wait briefly for it to disappear
+                self.page.wait_for_selector(self.selectors["cookie_banner"], state="hidden", timeout=3000)
+        except Exception as e:
+            # We don't want to crash if the banner check fails or doesn't exist
+            logger.debug(f"Cookie banner check ignored: {e}")
+
+        # 2. General Dialogs (Escape)
         try:
             if self.page.is_visible("div[role='dialog']"):
                 self.page.keyboard.press("Escape")
@@ -189,6 +188,7 @@ class ClaudeProvider(LLMProvider):
         if not self.is_fully_ready():
             self.wait_for_chat_input(timeout=10000)
 
+        # Ensure no banners block the view
         self.handle_dialogs()
         
         try:
